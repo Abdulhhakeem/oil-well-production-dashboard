@@ -29,6 +29,10 @@ SHEET_NAME = "Monthly Production Data"
 # Anomaly threshold: flag months where production changes by more than this %.
 ANOMALY_THRESHOLD_PCT = 25.0
 
+# Helper to replace positive and negative infinity with NaN
+def inf_to_nan(series):
+    return series.replace(float("inf"), float("nan")).replace(float("-inf"), float("nan"))
+
 
 # ──────────────────────────────────────────────────────────────
 # Load data (cached)
@@ -59,7 +63,7 @@ st.markdown(
         🛢️ PETROVISION — Oilfield Production Intelligence Dashboard
     </h1>
     <p style='color: #666; font-size: 0.9rem; margin-top: 0;'>
-        Volpe Field • Monthly Production Data
+        Volve Field • Monthly Production Data
     </p>
     """,
     unsafe_allow_html=True,
@@ -126,7 +130,6 @@ total_water = filtered["Water"].sum()
 
 # Active wells count
 active_wells = filtered["Wellbore name"].nunique()
-total_months = filtered["Date"].nunique()
 
 cols = st.columns(4)
 with cols[0]:
@@ -260,7 +263,7 @@ anomaly_col = st.selectbox(
 anomaly_records = []
 for well, well_df in filtered.groupby("Wellbore name"):
     well_df = well_df.sort_values("Date").copy()
-    well_df["pct_change"] = well_df[anomaly_col].pct_change() * 100
+    well_df["pct_change"] = inf_to_nan(well_df[anomaly_col].pct_change()) * 100
     anomalies = well_df[
         (well_df["pct_change"].abs() > ANOMALY_THRESHOLD_PCT) &
         (well_df["pct_change"].notna())
@@ -309,7 +312,7 @@ csv = summary_report.to_csv(index=False).encode("utf-8")
 st.download_button(
     label="📥 Download Summary Report (CSV)",
     data=csv,
-    file_name="petevision_production_summary.csv",
+    file_name="petrovision_production_summary.csv",
     mime="text/csv",
     key="download-csv",
 )
