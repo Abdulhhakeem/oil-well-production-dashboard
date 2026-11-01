@@ -13,6 +13,7 @@ import streamlit as st
 import sys
 sys.path.append("src")
 from loader import load_data
+from upload import detect_columns, validate, MAP_RULES
 
 # ──────────────────────────────────────────────────────────────
 # Configuration
@@ -138,7 +139,97 @@ for col in ["Oil", "Gas", "Water"]:
 # ──────────────────────────────────────────────────────────────
 st.sidebar.header("PETROVISION Filter")
 
-well_names = sorted(df["Wellbore name"].unique())
+# ── Phase 1 Data Source ──
+st.sidebar.markdown("---")
+st.sidebar.subheader("📁 Data Source")
+if "data_source" not in st.session_state:
+    st.session_state.data_source = "volve"
+if "uploaded_df" not in st.session_state:
+    st.session_state.uploaded_df = None
+if "mapping" not in st.session_state:
+    st.session_state.mapping = {}
+
+source = st.sidebar.radio("Select source:", ["Demo (Volve)", "Upload Dataset"], index=0 if st.session_state.data_source=="volve" else 1, key="ds_radio")
+st.session_state.data_source = "volve" if source=="Demo (Volve)" else "upload"
+# Reset aggregate-state when switching sources
+if source == "Demo (Volve)":
+    st.session_state["no_well_id"] = False
+    st.session_state.uploaded_df = None
+    st.session_state.mapping = {}
+
+df_work = df.copy()
+if st.session_state.data_source == "upload":
+    uploaded = st.sidebar.file_uploader("Upload CSV / Excel", type=["csv","xlsx","xls"], key="up")
+    if uploaded:
+        if uploaded.name.lower().endswith(".csv"):
+            df_up = pd.read_csv(uploaded)
+        else:
+            xl = pd.ExcelFile(uploaded)
+            sheet = st.sidebar.selectbox("Worksheet", xl.sheet_names, key="sheet")
+            df_up = pd.read_excel(uploaded, sheet_name=sheet)
+        detected = detect_columns(df_up)
+        st.sidebar.caption(f"Detected: {', '.join(detected)}")
+        # Manual mapping — visible dropdowns showing every uploaded column
+        mapping = {}
+        for label, std in [
+            ("Oil production (required)", "Oil"),
+            ("Production date (required)", "Date"),
+            ("Gas production (optional)", "Gas"),
+            ("Water production (optional)", "Water"),
+            ("Wellbore name (optional)", "Wellbore name"),
+        ]:
+            opts = ["-- Select column --"] + list(df_up.columns) + (["Not available"] if "optional" in label else [])
+            mapping[std] = st.sidebar.selectbox(label, opts, index=0, key=f"map_{std}")
+        st.session_state.mapping = mapping
+        df_renamed = df_up.rename(columns={v:k for k,v in mapping.items() if v in df_up.columns})
+        val = validate(df_renamed, mapping)
+        st.sidebar.info(f"Records: {val['total']} | Valid: {val['valid']} | Issues: {len(val['issues'])}")
+        for issue in val["issues"]:
+            st.sidebar.caption("⚠ "+issue)
+        if val["valid"] > 0:
+            df_work = df_renamed.copy()
+            # Normalize mapped production cols (only if actually mapped); do NOT zero-fill missing
+            for c in ["Oil","Gas","Water"]:
+                if c in df_work.columns:
+                    df_work[c] = pd.to_numeric(df_work[c], errors="coerce")
+            # Build Date from mapped Year/Month OR from mapped Date column
+            if "Year" in df_work.columns and "Month" in df_work.columns:
+                df_work["Date"] = pd.to_datetime({"year": df_work["Year"].astype(int), "month": df_work["Month"].astype(int), "day": 1}, errors="coerce")
+            elif "Date" in df_work.columns:
+                df_work["Date"] = pd.to_datetime(df_work["Date"], errors="coerce")
+            # Wellbore name
+            if "Wellbore name" in df_work.columns:
+                df_work = df_work[df_work["Wellbore name"].notna()].copy()
+                st.session_state["no_well_id"] = False
+            else:
+                st.session_state["no_well_id"] = True
+            st.session_state.uploaded_df = df_work
+            st.session_state.data_source = "upload"
+
+# ── Phase 1.5 Dataset Preview ──
+if st.session_state.data_source == "upload" and "mapping" in st.session_state and st.session_state.mapping:
+    st.subheader("Dataset Preview")
+    preview_df = df_work.head(10).copy() if "Wellbore name" in df_work.columns else pd.DataFrame()
+    if not preview_df.empty:
+        # Show mapped columns only for clarity
+        display_cols = [st.session_state.mapping.get(k) for k in ["Wellbore name","Oil","Gas","Water","Year","Month"] if k in st.session_state.mapping and st.session_state.mapping.get(k) in preview_df.columns]
+        if display_cols:
+            st.dataframe(preview_df[display_cols].style.format({
+                "Oil":"{:,.0f}","Gas":"{:,.0f}","Water":"{:,.0f}"
+            }), use_container_width=True, height=250)
+    # Mapping summary
+    mapping_items = [(k, st.session_state.mapping.get(k, "—")) for k in ["Wellbore name","Oil","Gas","Water","Year","Month"]]
+    mapping_df = pd.DataFrame(mapping_items, columns=["Field", "Mapped Column"])
+    st.caption("Column mappings")
+    st.dataframe(mapping_df, use_container_width=True, hide_index=True, height=min(120, 40+20*len(mapping_items)))
+    # Concise validation (re-run quickly)
+    val_quick = validate(df_work, st.session_state.mapping) if "mapping" in st.session_state else {"total":len(df_work),"valid":len(df_work),"issues":[]}
+    st.info(f"Records: {val_quick['total']} | Valid: {val_quick['valid']} | Warnings: {len(val_quick.get('issues',[]))}")
+    for issue in val_quick.get("issues", [])[:3]:
+        st.caption("⚠ " + issue)
+
+# Sidebar controls — only show when Volve/demosource or validated upload
+well_names = sorted(df_work["Wellbore name"].dropna().unique()) if "Wellbore name" in df_work.columns else []
 selected_wells = st.sidebar.multiselect(
     "📋 Well(s)",
     options=well_names,
@@ -146,9 +237,13 @@ selected_wells = st.sidebar.multiselect(
     help="Select one or more wells to include in the analysis.",
 )
 
-# Date range filter
-min_date = df["Date"].min()
-max_date = df["Date"].max()
+# Date range filter — from working dataset
+if "Date" in df_work.columns and df_work["Date"].notna().any():
+    min_date = df_work["Date"].min()
+    max_date = df_work["Date"].max()
+else:
+    min_date = pd.Timestamp("2020-01-01")
+    max_date = pd.Timestamp("2025-12-31")
 date_range = st.sidebar.date_input(
     "📅 Date range",
     value=(min_date, max_date),
@@ -156,11 +251,35 @@ date_range = st.sidebar.date_input(
     max_value=max_date,
 )
 
-# Apply filters
-filtered = df[df["Wellbore name"].isin(selected_wells)].copy()
-if len(date_range) == 2:
-    filtered = filtered[(filtered["Date"] >= pd.Timestamp(date_range[0])) &
-                        (filtered["Date"] <= pd.Timestamp(date_range[1]))]
+# Apply filters on working dataset
+if st.session_state.get("no_well_id"):
+    # Aggregate dataset — no well selection / filtering
+    filtered = df_work.copy()
+    # Still apply date filter if available
+    if len(date_range) == 2 and "Date" in filtered.columns and filtered["Date"].notna().any():
+        min_d, max_d = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
+        filtered = filtered[(filtered["Date"] >= min_d) & (filtered["Date"] <= max_d)]
+else:
+    filtered = df_work[df_work["Wellbore name"].isin(selected_wells)].copy()
+    if len(date_range) == 2 and "Date" in filtered.columns and filtered["Date"].notna().any():
+        min_d, max_d = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
+        filtered = filtered[(filtered["Date"] >= min_d) & (filtered["Date"] <= max_d)]
+
+# Before analytics: gate only on mandatory Oil + Date; Gas/Water/Well optional
+if st.session_state.data_source == "upload":
+    missing_mandatory = []
+    if "Oil" not in df_work.columns:
+        missing_mandatory.append("Oil")
+    has_date = ("Date" in df_work.columns and df_work["Date"].notna().any()) or ("Year" in df_work.columns and "Month" in df_work.columns and df_work["Year"].notna().any() and df_work["Month"].notna().any())
+    if not has_date:
+        missing_mandatory.append("Date (or Year + Month)")
+    if missing_mandatory:
+        st.error("Missing mandatory mapped columns: " + ", ".join(missing_mandatory) + ". Map them in the upload sidebar to proceed.")
+        st.session_state["upload_blocked"] = True
+    else:
+        st.session_state["upload_blocked"] = False
+else:
+    st.session_state["upload_blocked"] = False
 
 st.sidebar.markdown("---")
 st.sidebar.info(
@@ -174,37 +293,40 @@ st.sidebar.info(
 # 1. Executive Summary — KPI Cards
 # ──────────────────────────────────────────────────────────────
 st.subheader("Executive Summary")
-
-# KPI row: 4 core production metrics — aligned card grid with consistent spacing
-total_oil = filtered["Oil"].sum()
-total_gas = filtered["Gas"].sum()
-total_water = filtered["Water"].sum()
-active_wells = filtered["Wellbore name"].nunique()
-if total_oil > 0:
-    wor = total_water / total_oil
+if st.session_state.get("upload_blocked"):
+    st.warning("Upload dataset is missing required columns — executive summary skipped until mapped.")
 else:
-    wor = 0.0
+    # KPI row: 4 core production metrics — aligned card grid with consistent spacing
+    total_oil = filtered["Oil"].sum() if "Oil" in filtered.columns else 0.0
+    total_gas = filtered["Gas"].sum() if "Gas" in filtered.columns else 0.0
+    total_water = filtered["Water"].sum() if "Water" in filtered.columns else 0.0
+    active_wells = filtered["Wellbore name"].nunique() if "Wellbore name" in filtered.columns else 0
+    if total_oil > 0:
+        wor = total_water / total_oil
+    else:
+        wor = 0.0
 
-cols = st.columns(4)
-with cols[0]:
-    st.metric("Total Oil Produced", f"{total_oil:,.0f} Sm³")
-with cols[1]:
-    st.metric("Total Gas Produced", f"{total_gas:,.0f} Sm³")
-with cols[2]:
-    st.metric("Total Water Produced", f"{total_water:,.0f} Sm³")
-with cols[3]:
-    st.metric("Active Wells", f"{active_wells}")
+    cols = st.columns(4)
+    with cols[0]:
+        st.metric("Total Oil Produced", f"{total_oil:,.0f} Sm³")
+    with cols[1]:
+        st.metric("Total Gas Produced", f"{total_gas:,.0f} Sm³")
+    with cols[2]:
+        st.metric("Total Water Produced", f"{total_water:,.0f} Sm³")
+    with cols[3]:
+        st.metric("Active Wells", f"{active_wells}")
 
-# Secondary indicator — WOR, consistent typography, restrained visual hierarchy
-st.markdown("**Water-to-Oil Ratio**")
-st.metric("WOR (Water / Oil)", f"{wor:.2f}", help="Higher values indicate increasing water cut.")
+    # Secondary indicator — WOR, consistent typography, restrained visual hierarchy
+    st.markdown("**Water-to-Oil Ratio**")
+    st.metric("WOR (Water / Oil)", f"{wor:.2f}", help="Higher values indicate increasing water cut.")
+    st.markdown("**Water-to-Oil Ratio**")
+    st.metric("WOR (Water / Oil)", f"{wor:.2f}", help="Higher values indicate increasing water cut.")
 
 
 # ──────────────────────────────────────────────────────────────
 # 2. Production Trends Over Time
 # ──────────────────────────────────────────────────────────────
 st.subheader("Production Trends Over Time")
-
 metric_choice = st.radio(
     "Select metric to chart:",
     options=["Oil", "Gas", "Water"],
@@ -213,69 +335,75 @@ metric_choice = st.radio(
     index=0,
     key="trend_metric",
 )
-
-# Aggregate monthly across selected wells
-monthly = (
-    filtered.groupby("Date")[metric_choice]
-    .sum()
-    .resample("MS")
-    .sum()
-    .reset_index()
-)
-
-fig_trend = go.Figure()
-fig_trend.add_trace(
-    go.Scatter(
-        x=monthly["Date"],
-        y=monthly[metric_choice],
-        mode="lines+markers",
-        line=dict(width=2.5, color="#f59e0b"),
-        name=metric_choice,
+if st.session_state.get("upload_blocked") or metric_choice not in filtered.columns:
+    st.info("Trend unavailable — required production column not mapped or missing.")
+else:
+    # Aggregate monthly across selected wells
+    monthly = (
+        filtered.groupby("Date")[metric_choice]
+        .sum()
+        .resample("MS")
+        .sum()
+        .reset_index()
     )
-)
-fig_trend.update_layout(
-    title=f"Monthly {metric_choice} Production Trend",
-    xaxis_title="Production Date",
-    yaxis_title=f"{metric_choice} Produced (Sm³)",
-    template="plotly_dark",
-    height=450,
-    hovermode="x unified",
-)
-st.plotly_chart(fig_trend, width="stretch")
+
+    fig_trend = go.Figure()
+    fig_trend.add_trace(
+        go.Scatter(
+            x=monthly["Date"],
+            y=monthly[metric_choice],
+            mode="lines+markers",
+            line=dict(width=2.5, color="#f59e0b"),
+            name=metric_choice,
+        )
+    )
+    fig_trend.update_layout(
+        title=f"Monthly {metric_choice} Production Trend",
+        xaxis_title="Production Date",
+        yaxis_title=f"{metric_choice} Produced (Sm³)",
+        template="plotly_dark",
+        height=450,
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig_trend, width="stretch")
 
 
 # ──────────────────────────────────────────────────────────────
 # 3. Well Surveillance — Production Comparison
 # ──────────────────────────────────────────────────────────────
 st.subheader("Well Surveillance — Production Comparison")
-
-surveillance_metric = st.radio(
+if "Wellbore name" not in filtered.columns:
+    st.info("Uploaded dataset has no well identifier mapped; well-level surveillance is unavailable.")
+else:
+    surveillance_metric = st.radio(
     "Comparison metric:",
     options=["Oil", "Gas", "Water"],
     horizontal=True,
     key="surveillance_metric",
 )
+    if surveillance_metric not in filtered.columns:
+        st.info(f"Surveillance unavailable — {surveillance_metric} not mapped.")
+    else:
+        # Aggregate per well
+        well_metrics = filtered.groupby("Wellbore name")[surveillance_metric].sum().sort_values(ascending=False)
 
-# Aggregate per well
-well_metrics = filtered.groupby("Wellbore name")[surveillance_metric].sum().sort_values(ascending=False)
-
-fig_wells = go.Figure()
-fig_wells.add_trace(
-    go.Bar(
-        x=well_metrics.values,
-        y=well_metrics.index,
-        orientation="h",
-        marker_color="#f59e0b",
-    )
-)
-fig_wells.update_layout(
-    title=f"{surveillance_metric} Production by Well",
-    xaxis_title=f"Total {surveillance_metric} (Sm³)",
-    yaxis_title="Wellbore Name",
-    template="plotly_dark",
-    height=500,
-)
-st.plotly_chart(fig_wells, width="stretch")
+        fig_wells = go.Figure()
+        fig_wells.add_trace(
+            go.Bar(
+                x=well_metrics.values,
+                y=well_metrics.index,
+                orientation="h",
+                marker_color="#f59e0b",
+            )
+        )
+        fig_wells.update_layout(
+            title=f"{surveillance_metric} Production by Well",
+            xaxis_title=f"Total {surveillance_metric} (Sm³)",
+            yaxis_title="Wellbore Name",
+            template="plotly_dark",
+            height=500,
+        )
+        st.plotly_chart(fig_wells, width="stretch")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -292,19 +420,36 @@ anomaly_col = st.selectbox(
 
 # Calculate month-over-month percentage change per well, then find anomalies
 anomaly_records = []
-for well, well_df in filtered.groupby("Wellbore name"):
-    well_df = well_df.sort_values("Date").copy()
-    well_df["pct_change"] = inf_to_nan(well_df[anomaly_col].pct_change()) * 100
-    anomalies = well_df[
-        (well_df["pct_change"].abs() > ANOMALY_THRESHOLD_PCT) &
-        (well_df["pct_change"].notna())
+if "Wellbore name" in filtered.columns:
+    for well, well_df in filtered.groupby("Wellbore name"):
+        well_df = well_df.sort_values("Date").copy()
+        well_df["pct_change"] = inf_to_nan(well_df[anomaly_col].pct_change()) * 100
+        anomalies = well_df[
+            (well_df["pct_change"].abs() > ANOMALY_THRESHOLD_PCT) &
+            (well_df["pct_change"].notna())
+        ]
+        for _, row in anomalies.iterrows():
+            anomaly_records.append({
+                "Well": well,
+                "Date": row["Date"].strftime("%Y-%m"),
+                "Value": row[anomaly_col],
+                "Previous Value": well_df.loc[row.name, anomaly_col],
+                "Change (%)": round(row["pct_change"], 1),
+            })
+else:
+    # Aggregate-level anomaly: overall monthly pct change (no per-well split)
+    agg_df = filtered.sort_values("Date").copy()
+    agg_df["pct_change"] = inf_to_nan(agg_df[anomaly_col].pct_change()) * 100
+    anomalies = agg_df[
+        (agg_df["pct_change"].abs() > ANOMALY_THRESHOLD_PCT) &
+        (agg_df["pct_change"].notna())
     ]
     for _, row in anomalies.iterrows():
         anomaly_records.append({
-            "Well": well,
+            "Well": "Aggregate",
             "Date": row["Date"].strftime("%Y-%m"),
             "Value": row[anomaly_col],
-            "Previous Value": well_df.loc[row.name, anomaly_col],
+            "Previous Value": agg_df.loc[row.name, anomaly_col],
             "Change (%)": round(row["pct_change"], 1),
         })
 
@@ -324,316 +469,321 @@ else:
 # 6. Water Cut Analysis (Phase 2 — Feature 1)
 # ─────────────────────────────────────────────────────────────────────────
 st.subheader("Water Cut Analysis")
-
-# Filter valid observations (both Oil and Water present; not missing values)
-valid_water = filtered[
-    filtered["Oil"].notna() & filtered["Water"].notna() &
-    (filtered["Oil"] + filtered["Water"] > 0)  # non-zero denominator
-].copy()
-valid_water["Water_Cut_pct"] = (valid_water["Water"] / (valid_water["Oil"] + valid_water["Water"])) * 100
-
-# 6.1 KPI — Aggregate Water Cut for filtered dataset
-aggregate_oil = valid_water["Oil"].sum()
-aggregate_water = valid_water["Water"].sum()
-if (aggregate_oil + aggregate_water) > 0:
-    aggregate_wc = (aggregate_water / (aggregate_oil + aggregate_water)) * 100
+if "Oil" not in filtered.columns or "Water" not in filtered.columns:
+    st.info("Water Cut unavailable — requires both Oil and Water mapped.")
 else:
-    aggregate_wc = float("nan")
+    # Filter valid observations (both Oil and Water present; not missing values)
+    valid_water = filtered[
+        filtered["Oil"].notna() & filtered["Water"].notna() &
+        (filtered["Oil"] + filtered["Water"] > 0)
+    ].copy()
+    valid_water["Water_Cut_pct"] = (valid_water["Water"] / (valid_water["Oil"] + valid_water["Water"])) * 100
 
-kpi_cols = st.columns(3)
-with kpi_cols[0]:
-    st.metric(
-        label="💧 Aggregate Water Cut",
-        value=f"{aggregate_wc:.1f}%" if not (aggregate_wc != aggregate_wc) else "N/A",
-        help="Water / (Oil + Water) × 100 across all valid observations in the selected filters.",
-    )
-with kpi_cols[1]:
-    st.metric(
-        label="📊 Valid Observations",
-        value=str(len(valid_water)),
-        help="Records with non-missing Oil and Water and non-zero denominator.",
-    )
-with kpi_cols[2]:
-    # Average water cut across observations (not weighted by volume)
-    avg_wc = valid_water["Water_Cut_pct"].mean() if len(valid_water) > 0 else float("nan")
-    st.metric(
-        label="📈 Average Water Cut",
-        value=f"{avg_wc:.1f}%" if not (avg_wc != avg_wc) else "N/A",
-        help="Simple arithmetic mean of monthly water-cut percentages.",
-    )
-
-st.caption("Flagged changes require review and do not establish an operational cause.")
-
-# 6.2 Water Cut Trend Over Time — by well selection
-st.markdown("**Water Cut Trend Over Time**")
-trend_col = st.selectbox(
-    "Well for trend (select one or view all):",
-    options=["All Selected Wells"] + sorted(valid_water["Wellbore name"].unique()) if not valid_water.empty else ["No data"],
-    index=0,
-    key="wc_trend_well",
-)
-
-trend_df = valid_water.copy()
-if trend_col != "All Selected Wells" and not valid_water.empty:
-    trend_df = valid_water[valid_water["Wellbore name"] == trend_col]
-
-trend_df = trend_df.sort_values("Date")
-
-if not trend_df.empty:
-    fig_wc = go.Figure()
-    if trend_col == "All Selected Wells":
-        for well in sorted(trend_df["Wellbore name"].unique()):
-            well_trend = trend_df[trend_df["Wellbore name"] == well].sort_values("Date")
-            fig_wc.add_trace(go.Scatter(
-                x=well_trend["Date"], y=well_trend["Water_Cut_pct"],
-                mode="lines+markers", name=well,
-                line=dict(width=1.5),
-            ))
+    # 6.1 KPI
+    aggregate_oil = valid_water["Oil"].sum()
+    aggregate_water = valid_water["Water"].sum()
+    if (aggregate_oil + aggregate_water) > 0:
+        aggregate_wc = (aggregate_water / (aggregate_oil + aggregate_water)) * 100
     else:
-        fig_wc.add_trace(go.Scatter(
-            x=trend_df["Date"], y=trend_df["Water_Cut_pct"],
-            mode="lines+markers", name=trend_col,
-            line=dict(width=2, color="#2f769b"),
+        aggregate_wc = float("nan")
+
+    kpi_cols = st.columns(3)
+    with kpi_cols[0]:
+        st.metric(
+            label="💧 Aggregate Water Cut",
+            value=f"{aggregate_wc:.1f}%" if not (aggregate_wc != aggregate_wc) else "N/A",
+            help="Water / (Oil + Water) × 100 across all valid observations in the selected filters.",
+        )
+    with kpi_cols[1]:
+        st.metric(
+            label="📊 Valid Observations",
+            value=str(len(valid_water)),
+            help="Records with non-missing Oil and Water and non-zero denominator.",
+        )
+    with kpi_cols[2]:
+        avg_wc = valid_water["Water_Cut_pct"].mean() if len(valid_water) > 0 else float("nan")
+        st.metric(
+            label="📈 Average Water Cut",
+            value=f"{avg_wc:.1f}%" if not (avg_wc != avg_wc) else "N/A",
+            help="Simple arithmetic mean of monthly water-cut percentages.",
+        )
+
+    st.caption("Flagged changes require review and do not establish an operational cause.")
+
+    # 6.2 Water Cut Trend Over Time — by well selection
+    st.markdown("**Water Cut Trend Over Time**")
+    trend_col = st.selectbox(
+        "Well for trend (select one or view all):",
+        options=["All Selected Wells"] + sorted(valid_water["Wellbore name"].unique()) if not valid_water.empty else ["No data"],
+        index=0,
+        key="wc_trend_well",
+    )
+
+    trend_df = valid_water.copy()
+    if trend_col != "All Selected Wells" and not valid_water.empty:
+        trend_df = valid_water[valid_water["Wellbore name"] == trend_col]
+
+    trend_df = trend_df.sort_values("Date")
+
+    if not trend_df.empty:
+        fig_wc = go.Figure()
+        if trend_col == "All Selected Wells":
+            for well in sorted(trend_df["Wellbore name"].unique()):
+                well_trend = trend_df[trend_df["Wellbore name"] == well].sort_values("Date")
+                fig_wc.add_trace(go.Scatter(
+                    x=well_trend["Date"], y=well_trend["Water_Cut_pct"],
+                    mode="lines+markers", name=well,
+                    line=dict(width=1.5),
+                ))
+        else:
+            fig_wc.add_trace(go.Scatter(
+                x=trend_df["Date"], y=trend_df["Water_Cut_pct"],
+                mode="lines+markers", name=trend_col,
+                line=dict(width=2, color="#2f769b"),
+            ))
+        fig_wc.update_layout(
+            title="Monthly Water Cut (%)",
+            xaxis_title="Production Date",
+            yaxis_title="Water Cut (%)",
+            yaxis=dict(range=[0, max(100, trend_df["Water_Cut_pct"].max() * 1.1 if not trend_df.empty else 100)]),
+            template="plotly_dark",
+            height=400,
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_wc, width="stretch")
+    else:
+        st.info("No valid water-cut observations for the selected filters.")
+
+    # 6.3 Well Comparison Chart — Water Cut by Well
+    st.markdown("**Well Comparison — Average Water Cut**")
+    if not valid_water.empty:
+        well_wc = valid_water.groupby("Wellbore name")["Water_Cut_pct"].mean().sort_values(ascending=False)
+        fig_wc_bar = go.Figure()
+        fig_wc_bar.add_trace(go.Bar(
+            x=well_wc.values,
+            y=well_wc.index,
+            orientation="h",
+            marker_color="#0d9488",
         ))
-    fig_wc.update_layout(
-        title="Monthly Water Cut (%)",
-        xaxis_title="Production Date",
-        yaxis_title="Water Cut (%)",
-        yaxis=dict(range=[0, max(100, trend_df["Water_Cut_pct"].max() * 1.1 if not trend_df.empty else 100)]),
-        template="plotly_dark",
-        height=400,
-        hovermode="x unified",
-    )
-    st.plotly_chart(fig_wc, width="stretch")
-else:
-    st.info("No valid water-cut observations for the selected filters.")
+        fig_wc_bar.update_layout(
+            title="Average Water Cut by Well (%)",
+            xaxis_title="Average Water Cut (%)",
+            yaxis_title="Wellbore Name",
+            template="plotly_dark",
+            height=400,
+        )
+        st.plotly_chart(fig_wc_bar, width="stretch")
+    else:
+        st.info("No data available for well comparison.")
 
-# 6.3 Well Comparison Chart — Water Cut by Well
-st.markdown("**Well Comparison — Average Water Cut**")
-if not valid_water.empty:
-    well_wc = valid_water.groupby("Wellbore name")["Water_Cut_pct"].mean().sort_values(ascending=False)
-    fig_wc_bar = go.Figure()
-    fig_wc_bar.add_trace(go.Bar(
-        x=well_wc.values,
-        y=well_wc.index,
-        orientation="h",
-        marker_color="#0d9488",
-    ))
-    fig_wc_bar.update_layout(
-        title="Average Water Cut by Well (%)",
-        xaxis_title="Average Water Cut (%)",
-        yaxis_title="Wellbore Name",
-        template="plotly_dark",
-        height=400,
-    )
-    st.plotly_chart(fig_wc_bar, width="stretch")
-else:
-    st.info("No data available for well comparison.")
-
-# 6.4 Well Summary Table — sortable
-st.markdown("**Well Summary — Water Cut**")
-if not valid_water.empty:
-    wc_summary = valid_water.groupby("Wellbore name").agg(
-        Average_Water_Cut_pct=("Water_Cut_pct", "mean"),
-        Valid_Observations=("Water_Cut_pct", "count"),
-    ).round(2).reset_index()
-    wc_summary = wc_summary.sort_values("Average_Water_Cut_pct", ascending=False)
-    wc_summary.columns = ["Wellbore Name", "Average Water Cut (%)", "Valid Observations"]
-    st.dataframe(wc_summary.style.format({
-        "Average Water Cut (%)": "{:,.2f}",
-    }), width="stretch", height=300)
-else:
-    st.info("No valid observations for water-cut summary.")
+    # 6.4 Well Summary Table — sortable
+    st.markdown("**Well Summary — Water Cut**")
+    if not valid_water.empty:
+        wc_summary = valid_water.groupby("Wellbore name").agg(
+            Average_Water_Cut_pct=("Water_Cut_pct", "mean"),
+            Valid_Observations=("Water_Cut_pct", "count"),
+        ).round(2).reset_index()
+        wc_summary = wc_summary.sort_values("Average_Water_Cut_pct", ascending=False)
+        wc_summary.columns = ["Wellbore Name", "Average Water Cut (%)", "Valid Observations"]
+        st.dataframe(wc_summary.style.format({
+            "Average Water Cut (%)": "{:,.2f}",
+        }), width="stretch", height=300)
+    else:
+        st.info("No valid observations for water-cut summary.")
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # 7. Gas-Oil Ratio (GOR) Analysis (Phase 2 — Feature 2)
 # ─────────────────────────────────────────────────────────────────────────
 st.subheader("Gas-Oil Ratio (GOR) Analysis")
-
-# Filter valid observations (both Gas and Oil present, Oil > 0 to avoid division by zero)
-valid_gor = filtered[
-    filtered["Gas"].notna() & filtered["Oil"].notna() & (filtered["Oil"] > 0)
-].copy()
-valid_gor["GOR"] = valid_gor["Gas"] / valid_gor["Oil"]
-
-# 7.1 KPI — Aggregate GOR (total gas / total oil) for filtered dataset
-aggregate_gas = valid_gor["Gas"].sum()
-aggregate_oil_gor = valid_gor["Oil"].sum()
-if aggregate_oil_gor > 0:
-    aggregate_gor = aggregate_gas / aggregate_oil_gor
+if "Oil" not in filtered.columns or "Gas" not in filtered.columns:
+    st.info("GOR unavailable — requires both Oil and Gas mapped.")
 else:
-    aggregate_gor = float("nan")
+    # Filter valid observations (both Gas and Oil present, Oil > 0 to avoid division by zero)
+    valid_gor = filtered[
+        filtered["Gas"].notna() & filtered["Oil"].notna() & (filtered["Oil"] > 0)
+    ].copy()
+    valid_gor["GOR"] = valid_gor["Gas"] / valid_gor["Oil"]
 
-kpi_cols = st.columns(3)
-with kpi_cols[0]:
-    st.metric(
-        label="⚡ Aggregate GOR (Total Gas / Total Oil)",
-        value=f"{aggregate_gor:.2f}" if not (aggregate_gor != aggregate_gor) else "N/A",
-        help="Total Gas / Total Oil in Sm³/Sm³ for valid observations in selected filters.",
-    )
-with kpi_cols[1]:
-    st.metric(
-        label="📊 Valid GOR Observations",
-        value=str(len(valid_gor)),
-        help="Records with non-missing Gas and Oil and Oil > 0.",
-    )
-with kpi_cols[2]:
-    avg_gor = valid_gor["GOR"].mean() if len(valid_gor) > 0 else float("nan")
-    st.metric(
-        label="📈 Average Monthly GOR (Arithmetic Mean)",
-        value=f"{avg_gor:.2f}" if not (avg_gor != avg_gor) else "N/A",
-        help="Simple arithmetic mean of monthly GOR values (not weighted by volume).",
-    )
-
-st.caption("Flagged changes require review and do not establish an operational cause.")
-
-# 7.2 GOR Trend Over Time
-st.markdown("**GOR Trend Over Time**")
-gor_trend_col = st.selectbox(
-    "Well for GOR trend (select one or view all):",
-    options=["All Selected Wells"] + sorted(valid_gor["Wellbore name"].unique()) if not valid_gor.empty else ["No data"],
-    index=0,
-    key="gor_trend_well",
-)
-
-gor_trend_df = valid_gor.copy()
-if gor_trend_col != "All Selected Wells" and not valid_gor.empty:
-    gor_trend_df = valid_gor[valid_gor["Wellbore name"] == gor_trend_col]
-
-gor_trend_df = gor_trend_df.sort_values("Date")
-
-if not gor_trend_df.empty:
-    fig_gor = go.Figure()
-    if gor_trend_col == "All Selected Wells":
-        for well in sorted(gor_trend_df["Wellbore name"].unique()):
-            well_trend = gor_trend_df[gor_trend_df["Wellbore name"] == well].sort_values("Date")
-            fig_gor.add_trace(go.Scatter(
-                x=well_trend["Date"], y=well_trend["GOR"],
-                mode="lines+markers", name=well,
-                line=dict(width=1.5),
-            ))
+    # 7.1 KPI — Aggregate GOR (total gas / total oil) for filtered dataset
+    aggregate_gas = valid_gor["Gas"].sum()
+    aggregate_oil_gor = valid_gor["Oil"].sum()
+    if aggregate_oil_gor > 0:
+        aggregate_gor = aggregate_gas / aggregate_oil_gor
     else:
-        fig_gor.add_trace(go.Scatter(
-            x=gor_trend_df["Date"], y=gor_trend_df["GOR"],
-            mode="lines+markers", name=gor_trend_col,
-            line=dict(width=2, color="#9e9ac8"),
+        aggregate_gor = float("nan")
+
+    kpi_cols = st.columns(3)
+    with kpi_cols[0]:
+        st.metric(
+            label="⚡ Aggregate GOR (Total Gas / Total Oil)",
+            value=f"{aggregate_gor:.2f}" if not (aggregate_gor != aggregate_gor) else "N/A",
+            help="Total Gas / Total Oil in Sm³/Sm³ for valid observations in selected filters.",
+        )
+    with kpi_cols[1]:
+        st.metric(
+            label="📊 Valid GOR Observations",
+            value=str(len(valid_gor)),
+            help="Records with non-missing Gas and Oil and Oil > 0.",
+        )
+    with kpi_cols[2]:
+        avg_gor = valid_gor["GOR"].mean() if len(valid_gor) > 0 else float("nan")
+        st.metric(
+            label="📈 Average Monthly GOR (Arithmetic Mean)",
+            value=f"{avg_gor:.2f}" if not (avg_gor != avg_gor) else "N/A",
+            help="Simple arithmetic mean of monthly GOR values (not weighted by volume).",
+        )
+
+    st.caption("Flagged changes require review and do not establish an operational cause.")
+
+    # 7.2 GOR Trend Over Time
+    st.markdown("**GOR Trend Over Time**")
+    gor_trend_col = st.selectbox(
+        "Well for GOR trend (select one or view all):",
+        options=["All Selected Wells"] + sorted(valid_gor["Wellbore name"].unique()) if not valid_gor.empty else ["No data"],
+        index=0,
+        key="gor_trend_well",
+    )
+
+    gor_trend_df = valid_gor.copy()
+    if gor_trend_col != "All Selected Wells" and not valid_gor.empty:
+        gor_trend_df = valid_gor[valid_gor["Wellbore name"] == gor_trend_col]
+
+    gor_trend_df = gor_trend_df.sort_values("Date")
+
+    if not gor_trend_df.empty:
+        fig_gor = go.Figure()
+        if gor_trend_col == "All Selected Wells":
+            for well in sorted(gor_trend_df["Wellbore name"].unique()):
+                well_trend = gor_trend_df[gor_trend_df["Wellbore name"] == well].sort_values("Date")
+                fig_gor.add_trace(go.Scatter(
+                    x=well_trend["Date"], y=well_trend["GOR"],
+                    mode="lines+markers", name=well,
+                    line=dict(width=1.5),
+                ))
+        else:
+            fig_gor.add_trace(go.Scatter(
+                x=gor_trend_df["Date"], y=gor_trend_df["GOR"],
+                mode="lines+markers", name=gor_trend_col,
+                line=dict(width=2, color="#9e9ac8"),
+            ))
+        fig_gor.update_layout(
+            title="Monthly Gas-Oil Ratio (Sm³/Sm³)",
+            xaxis_title="Production Date",
+            yaxis_title="GOR (Sm³/Sm³)",
+            template="plotly_dark",
+            height=400,
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_gor, width="stretch")
+    else:
+        st.info("No valid GOR observations for the selected filters.")
+
+    # 7.3 Well Comparison — Average GOR by Well
+    st.markdown("**Well Comparison — Average GOR (Sm³/Sm³)**")
+    if not valid_gor.empty:
+        well_gor = valid_gor.groupby("Wellbore name")["GOR"].mean().sort_values(ascending=False)
+        fig_gor_bar = go.Figure()
+        fig_gor_bar.add_trace(go.Bar(
+            x=well_gor.values,
+            y=well_gor.index,
+            orientation="h",
+            marker_color="#f59e0b",
         ))
-    fig_gor.update_layout(
-        title="Monthly Gas-Oil Ratio (Sm³/Sm³)",
-        xaxis_title="Production Date",
-        yaxis_title="GOR (Sm³/Sm³)",
-        template="plotly_dark",
-        height=400,
-        hovermode="x unified",
-    )
-    st.plotly_chart(fig_gor, width="stretch")
-else:
-    st.info("No valid GOR observations for the selected filters.")
+        fig_gor_bar.update_layout(
+            title="Average GOR by Well (Sm³/Sm³)",
+            xaxis_title="Average GOR (Sm³/Sm³)",
+            yaxis_title="Wellbore Name",
+            template="plotly_dark",
+            height=400,
+        )
+        st.plotly_chart(fig_gor_bar, width="stretch")
+    else:
+        st.info("No data available for GOR comparison.")
 
-# 7.3 Well Comparison — Average GOR by Well
-st.markdown("**Well Comparison — Average GOR (Sm³/Sm³)**")
-if not valid_gor.empty:
-    well_gor = valid_gor.groupby("Wellbore name")["GOR"].mean().sort_values(ascending=False)
-    fig_gor_bar = go.Figure()
-    fig_gor_bar.add_trace(go.Bar(
-        x=well_gor.values,
-        y=well_gor.index,
-        orientation="h",
-        marker_color="#f59e0b",
-    ))
-    fig_gor_bar.update_layout(
-        title="Average GOR by Well (Sm³/Sm³)",
-        xaxis_title="Average GOR (Sm³/Sm³)",
-        yaxis_title="Wellbore Name",
-        template="plotly_dark",
-        height=400,
-    )
-    st.plotly_chart(fig_gor_bar, width="stretch")
-else:
-    st.info("No data available for GOR comparison.")
-
-# 7.4 Well Summary Table — sortable
-st.markdown("**Well Summary — GOR**")
-if not valid_gor.empty:
-    gor_summary = valid_gor.groupby("Wellbore name").agg(
-        Average_GOR=("GOR", "mean"),
-        Valid_Observations=("GOR", "count"),
-    ).round(2).reset_index()
-    gor_summary = gor_summary.sort_values("Average_GOR", ascending=False)
-    gor_summary.columns = ["Wellbore Name", "Average GOR (Sm³/Sm³)", "Valid Observations"]
-    st.dataframe(gor_summary.style.format({
-        "Average GOR (Sm³/Sm³)": "{:,.2f}",
-    }), width="stretch", height=300)
-else:
-    st.info("No valid observations for GOR summary.")
+    # 7.4 Well Summary Table — sortable
+    st.markdown("**Well Summary — GOR**")
+    if not valid_gor.empty:
+        gor_summary = valid_gor.groupby("Wellbore name").agg(
+            Average_GOR=("GOR", "mean"),
+            Valid_Observations=("GOR", "count"),
+        ).round(2).reset_index()
+        gor_summary = gor_summary.sort_values("Average_GOR", ascending=False)
+        gor_summary.columns = ["Wellbore Name", "Average GOR (Sm³/Sm³)", "Valid Observations"]
+        st.dataframe(gor_summary.style.format({
+            "Average GOR (Sm³/Sm³)": "{:,.2f}",
+        }), width="stretch", height=300)
+    else:
+        st.info("No valid observations for GOR summary.")
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # 8. Well Performance Ranking (Phase 2 — Feature 3)
 # ─────────────────────────────────────────────────────────────────────────
 st.subheader("Well Performance Ranking")
-
-ranking_metric = st.selectbox(
+if "Wellbore name" not in filtered.columns:
+    st.info("Uploaded dataset has no well identifier mapped; well-level ranking is unavailable.")
+else:
+    ranking_metric = st.selectbox(
     "Rank wells by:",
     options=["Total Oil (Sm³)", "Total Gas (Sm³)", "Total Water (Sm³)", "Average Monthly Oil (Sm³/month)"],
     index=0,
     help="Select a metric to rank selected wells. Average uses valid monthly observations only.",
-)
+    )
 
-# Build ranking table (respecting filters, using valid observations for averages)
-ranking_rows = []
-for well in sorted(filtered["Wellbore name"].unique()):
-    well_data = filtered[filtered["Wellbore name"] == well].copy()
-    ranking_rows.append({
+    # Build ranking table (respecting filters, using valid observations for averages)
+    ranking_rows = []
+    for well in sorted(filtered["Wellbore name"].unique()):
+        well_data = filtered[filtered["Wellbore name"] == well].copy()
+        ranking_rows.append({
         "Wellbore Name": well,
-        "Total Oil (Sm³)": well_data["Oil"].sum(),
-        "Total Gas (Sm³)": well_data["Gas"].sum(),
-        "Total Water (Sm³)": well_data["Water"].sum(),
-        "Average Monthly Oil (Sm³/month)": well_data["Oil"].mean() if not well_data.empty else float("nan"),
-        "Valid Oil Obs": well_data["Oil"].notna().sum(),
-        "Valid Gas Obs": well_data["Gas"].notna().sum(),
-        "Valid Water Obs": well_data["Water"].notna().sum(),
+        "Total Oil (Sm³)": well_data["Oil"].sum() if "Oil" in well_data.columns else 0.0,
+        "Total Gas (Sm³)": well_data["Gas"].sum() if "Gas" in well_data.columns else 0.0,
+        "Total Water (Sm³)": well_data["Water"].sum() if "Water" in well_data.columns else 0.0,
+        "Average Monthly Oil (Sm³/month)": well_data["Oil"].mean() if "Oil" in well_data.columns and not well_data.empty else float("nan"),
+        "Valid Oil Obs": well_data["Oil"].notna().sum() if "Oil" in well_data.columns else 0,
+        "Valid Gas Obs": well_data["Gas"].notna().sum() if "Gas" in well_data.columns else 0,
+        "Valid Water Obs": well_data["Water"].notna().sum() if "Water" in well_data.columns else 0,
     })
 
-ranking_df = pd.DataFrame(ranking_rows)
+    ranking_df = pd.DataFrame(ranking_rows)
 
-# Sort by selected metric
-sort_col = {
+    # Sort by selected metric
+    sort_col = {
     "Total Oil (Sm³)": "Total Oil (Sm³)",
     "Total Gas (Sm³)": "Total Gas (Sm³)",
     "Total Water (Sm³)": "Total Water (Sm³)",
     "Average Monthly Oil (Sm³/month)": "Average Monthly Oil (Sm³/month)",
-}[ranking_metric]
-ranking_df = ranking_df.sort_values(sort_col, ascending=False).reset_index(drop=True)
+    }[ranking_metric]
+    ranking_df = ranking_df.sort_values(sort_col, ascending=False).reset_index(drop=True)
 
-# 8.1 Ranking Chart
-metric_key = {
+    # 8.1 Ranking Chart
+    metric_key = {
     "Total Oil (Sm³)": "Total Oil (Sm³)",
     "Total Gas (Sm³)": "Total Gas (Sm³)",
     "Total Water (Sm³)": "Total Water (Sm³)",
     "Average Monthly Oil (Sm³/month)": "Average Monthly Oil (Sm³/month)",
-}[ranking_metric]
+    }[ranking_metric]
 
-fig_rank = go.Figure()
-fig_rank.add_trace(go.Bar(
+    fig_rank = go.Figure()
+    fig_rank.add_trace(go.Bar(
     x=ranking_df[metric_key].values,
     y=ranking_df["Wellbore Name"],
     orientation="h",
     marker_color="#f59e0b",
-))
-fig_rank.update_layout(
+    ))
+    fig_rank.update_layout(
     title=f"Well Performance Ranking — {ranking_metric}",
     xaxis_title=ranking_metric,
     yaxis_title="Wellbore Name",
     template="plotly_dark",
     height=max(300, 50 * len(ranking_df)),
-)
-st.plotly_chart(fig_rank, width="stretch")
+    )
+    st.plotly_chart(fig_rank, width="stretch")
 
-# 8.2 Sortable Table
-st.markdown("**Well Performance Table**")
-st.dataframe(
+    # 8.2 Sortable Table
+    st.markdown("**Well Performance Table**")
+    st.dataframe(
     ranking_df.style.format({
         "Total Oil (Sm³)": "{:,.0f}",
         "Total Gas (Sm³)": "{:,.0f}",
@@ -642,100 +792,102 @@ st.dataframe(
     }),
     width="stretch",
     height=300,
-)
+    )
 
-st.caption("Ranking reflects cumulative or average production only. No operational superiority is claimed from production volume alone. Missing months are not treated as zero.")
+    st.caption("Ranking reflects cumulative or average production only. No operational superiority is claimed from production volume alone. Missing months are not treated as zero.")
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # 9. Individual Well Production Profiles (Phase 2 — Feature 4)
 # ─────────────────────────────────────────────────────────────────────────
 st.subheader("Individual Well Production Profiles")
-
-# Well selector — single well
-well_selector = st.selectbox(
+if "Wellbore name" not in filtered.columns:
+    st.info("Uploaded dataset has no well identifier mapped; individual well profiles are unavailable.")
+else:
+    # Well selector — single well
+    well_selector = st.selectbox(
     "Select a well to profile:",
     options=sorted(filtered["Wellbore name"].unique()) if not filtered.empty else ["No data"],
     index=0,
     key="profile_well",
 )
 
-if well_selector != "No data" and not filtered.empty and well_selector in filtered["Wellbore name"].values:
-    profile_df = filtered[filtered["Wellbore name"] == well_selector].copy()
-    profile_df = profile_df.sort_values("Date")
+    if well_selector != "No data" and not filtered.empty and well_selector in filtered["Wellbore name"].values:
+        profile_df = filtered[filtered["Wellbore name"] == well_selector].copy()
+        profile_df = profile_df.sort_values("Date")
 
-    # Date range info for selected well
-    first_date = profile_df["Date"].min() if not profile_df.empty else None
-    last_date = profile_df["Date"].max() if not profile_df.empty else None
-    available_months = profile_df["Date"].nunique() if not profile_df.empty else 0
+        # Date range info for selected well
+        first_date = profile_df["Date"].min() if not profile_df.empty else None
+        last_date = profile_df["Date"].max() if not profile_df.empty else None
+        available_months = profile_df["Date"].nunique() if not profile_df.empty else 0
 
-    # 9.1 Well Statistics
-    st.markdown("**Well Statistics**")
-    stats_cols = st.columns(4)
-    with stats_cols[0]:
-        st.metric("First Production", first_date.strftime("%Y-%m") if first_date is not None else "N/A")
-    with stats_cols[1]:
-        st.metric("Last Production", last_date.strftime("%Y-%m") if last_date is not None else "N/A")
-    with stats_cols[2]:
-        st.metric("Valid Observations", f"Oil:{profile_df['Oil'].notna().sum()} | Gas:{profile_df['Gas'].notna().sum()} | Water:{profile_df['Water'].notna().sum()}")
-    with stats_cols[3]:
-        total_oil_p = profile_df["Oil"].sum()
-        total_gas_p = profile_df["Gas"].sum()
-        total_water_p = profile_df["Water"].sum()
-        st.metric("Total Production", f"Oil:{total_oil_p:,.0f} | Gas:{total_gas_p:,.0f} | Water:{total_water_p:,.0f}")
+        # 9.1 Well Statistics
+        st.markdown("**Well Statistics**")
+        stats_cols = st.columns(4)
+        with stats_cols[0]:
+            st.metric("First Production", first_date.strftime("%Y-%m") if first_date is not None else "N/A")
+        with stats_cols[1]:
+            st.metric("Last Production", last_date.strftime("%Y-%m") if last_date is not None else "N/A")
+        with stats_cols[2]:
+            st.metric("Valid Observations", f"Oil:{profile_df['Oil'].notna().sum()} | Gas:{profile_df['Gas'].notna().sum()} | Water:{profile_df['Water'].notna().sum()}")
+        with stats_cols[3]:
+            total_oil_p = profile_df["Oil"].sum()
+            total_gas_p = profile_df["Gas"].sum()
+            total_water_p = profile_df["Water"].sum()
+            st.metric("Total Production", f"Oil:{total_oil_p:,.0f} | Gas:{total_gas_p:,.0f} | Water:{total_water_p:,.0f}")
 
-    # 9.2 Production History Charts (Oil, Gas, Water)
-    st.markdown("**Production History**")
-    metrics = ["Oil", "Gas", "Water"]
-    colors = {"Oil": "#2f769b", "Gas": "#9e9ac8", "Water": "#6baed6"}
-    fig_prod = make_subplots(rows=3, cols=1, shared_xaxes=True, subplot_titles=["Oil (Sm³)", "Gas (Sm³)", "Water (Sm³)"])
-    for i, m in enumerate(metrics, 1):
-        data = profile_df.sort_values("Date")
-        fig_prod.add_trace(
-            go.Scatter(x=data["Date"], y=data[m], mode="lines+markers", name=m, line=dict(width=2, color=colors[m]), showlegend=(i==1)),
-            row=i, col=1,
-        )
-    fig_prod.update_layout(height=700, template="plotly_dark", hovermode="x unified", title_text=f"{well_selector} — Monthly Production")
-    fig_prod.update_yaxes(title_text="Sm³")
-    st.plotly_chart(fig_prod, width="stretch")
+        # 9.2 Production History Charts (Oil, Gas, Water)
+        st.markdown("**Production History**")
+        metrics = ["Oil", "Gas", "Water"]
+        colors = {"Oil": "#2f769b", "Gas": "#9e9ac8", "Water": "#6baed6"}
+        fig_prod = make_subplots(rows=3, cols=1, shared_xaxes=True, subplot_titles=["Oil (Sm³)", "Gas (Sm³)", "Water (Sm³)"])
+        for i, m in enumerate(metrics, 1):
+            data = profile_df.sort_values("Date")
+            fig_prod.add_trace(
+                go.Scatter(x=data["Date"], y=data[m], mode="lines+markers", name=m, line=dict(width=2, color=colors[m]), showlegend=(i==1)),
+                row=i, col=1,
+            )
+        fig_prod.update_layout(height=700, template="plotly_dark", hovermode="x unified", title_text=f"{well_selector} — Monthly Production")
+        fig_prod.update_yaxes(title_text="Sm³")
+        st.plotly_chart(fig_prod, width="stretch")
 
-    # 9.3 Production Indicators (Water Cut, GOR)
-    st.markdown("**Production Indicators**")
-    profile_df["Water_Cut_pct"] = (profile_df["Water"] / (profile_df["Oil"] + profile_df["Water"])).replace([float("inf"), float("-inf")], float("nan")) * 100
-    profile_df["GOR"] = profile_df.apply(lambda row: row["Gas"]/row["Oil"] if pd.notna(row["Oil"]) and row["Oil"]>0 and pd.notna(row["Gas"]) else float("nan"), axis=1)
+        # 9.3 Production Indicators (Water Cut, GOR)
+        st.markdown("**Production Indicators**")
+        profile_df["Water_Cut_pct"] = (profile_df["Water"] / (profile_df["Oil"] + profile_df["Water"])).replace([float("inf"), float("-inf")], float("nan")) * 100
+        profile_df["GOR"] = profile_df.apply(lambda row: row["Gas"]/row["Oil"] if pd.notna(row["Oil"]) and row["Oil"]>0 and pd.notna(row["Gas"]) else float("nan"), axis=1)
 
-    indicator_df = profile_df.sort_values("Date")[["Date", "Water_Cut_pct", "GOR"]].copy()
-    indicator_df["Water_Cut_pct"] = indicator_df["Water_Cut_pct"].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "")
-    indicator_df["GOR"] = indicator_df["GOR"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "")
-    indicator_df["Date"] = indicator_df["Date"].dt.strftime("%Y-%m")
+        indicator_df = profile_df.sort_values("Date")[["Date", "Water_Cut_pct", "GOR"]].copy()
+        indicator_df["Water_Cut_pct"] = indicator_df["Water_Cut_pct"].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "")
+        indicator_df["GOR"] = indicator_df["GOR"].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "")
+        indicator_df["Date"] = indicator_df["Date"].dt.strftime("%Y-%m")
 
-    fig_ind = make_subplots(rows=2, cols=1, shared_xaxes=True, subplot_titles=["Water Cut (%)", "GOR (Sm³/Sm³)"])
-    wc_data = profile_df.sort_values("Date")
-    gor_data = profile_df.sort_values("Date")
-    fig_ind.add_trace(go.Scatter(x=wc_data["Date"], y=wc_data["Water_Cut_pct"], mode="lines+markers", name="Water Cut %", line=dict(width=2, color="#2f769b")), row=1, col=1)
-    fig_ind.add_trace(go.Scatter(x=gor_data["Date"], y=gor_data["GOR"], mode="lines+markers", name="GOR", line=dict(width=2, color="#6baed6")), row=2, col=1)
-    fig_ind.update_layout(height=600, template="plotly_dark", hovermode="x unified", title_text=f"{well_selector} — Production Indicators")
-    st.plotly_chart(fig_ind, width="stretch")
+        fig_ind = make_subplots(rows=2, cols=1, shared_xaxes=True, subplot_titles=["Water Cut (%)", "GOR (Sm³/Sm³)"])
+        wc_data = profile_df.sort_values("Date")
+        gor_data = profile_df.sort_values("Date")
+        fig_ind.add_trace(go.Scatter(x=wc_data["Date"], y=wc_data["Water_Cut_pct"], mode="lines+markers", name="Water Cut %", line=dict(width=2, color="#2f769b")), row=1, col=1)
+        fig_ind.add_trace(go.Scatter(x=gor_data["Date"], y=gor_data["GOR"], mode="lines+markers", name="GOR", line=dict(width=2, color="#6baed6")), row=2, col=1)
+        fig_ind.update_layout(height=600, template="plotly_dark", hovermode="x unified", title_text=f"{well_selector} — Production Indicators")
+        st.plotly_chart(fig_ind, width="stretch")
 
-    # 9.4 Monthly Production Table
-    st.markdown("**Monthly Production Table**")
-    table_df = profile_df.sort_values("Date").copy()
-    table_df["Water_Cut_pct"] = (table_df["Water"] / (table_df["Oil"] + table_df["Water"])).replace([float("inf"), float("-inf")], float("nan")) * 100
-    table_df["GOR"] = table_df.apply(lambda row: row["Gas"]/row["Oil"] if pd.notna(row["Oil"]) and row["Oil"]>0 and pd.notna(row["Gas"]) else float("nan"), axis=1)
-    display_table = table_df[["Date", "Oil", "Gas", "Water", "Water_Cut_pct", "GOR"]].copy()
-    display_table["Date"] = display_table["Date"].dt.strftime("%Y-%m")
-    # Format numeric columns with comma separators before converting to string
-    display_table["Oil"] = display_table["Oil"].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "—")
-    display_table["Gas"] = display_table["Gas"].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "—")
-    display_table["Water"] = display_table["Water"].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "—")
-    # Convert numeric display columns to string so missing markers don't trigger TypeError
-    display_table["Water_Cut_pct"] = display_table["Water_Cut_pct"].apply(lambda x: "—" if pd.isna(x) else f"{x:.1f}")
-    display_table["GOR"] = display_table["GOR"].apply(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
-    st.dataframe(display_table, width="stretch", height=400)
+        # 9.4 Monthly Production Table
+        st.markdown("**Monthly Production Table**")
+        table_df = profile_df.sort_values("Date").copy()
+        table_df["Water_Cut_pct"] = (table_df["Water"] / (table_df["Oil"] + table_df["Water"])).replace([float("inf"), float("-inf")], float("nan")) * 100
+        table_df["GOR"] = table_df.apply(lambda row: row["Gas"]/row["Oil"] if pd.notna(row["Oil"]) and row["Oil"]>0 and pd.notna(row["Gas"]) else float("nan"), axis=1)
+        display_table = table_df[["Date", "Oil", "Gas", "Water", "Water_Cut_pct", "GOR"]].copy()
+        display_table["Date"] = display_table["Date"].dt.strftime("%Y-%m")
+        # Format numeric columns with comma separators before converting to string
+        display_table["Oil"] = display_table["Oil"].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "—")
+        display_table["Gas"] = display_table["Gas"].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "—")
+        display_table["Water"] = display_table["Water"].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else "—")
+        # Convert numeric display columns to string so missing markers don't trigger TypeError
+        display_table["Water_Cut_pct"] = display_table["Water_Cut_pct"].apply(lambda x: "—" if pd.isna(x) else f"{x:.1f}")
+        display_table["GOR"] = display_table["GOR"].apply(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
+        st.dataframe(display_table, width="stretch", height=400)
 
-    st.caption("Available observations shown; missing months are not interpolated. Zero production is shown as 0; unavailable (missing) is shown as blank. No operational cause is inferred from trends.")
-else:
-    st.info("Select a well from the dropdown to view its production profile.")
+        st.caption("Available observations shown; missing months are not interpolated. Zero production is shown as 0; unavailable (missing) is shown as blank. No operational cause is inferred from trends.")
+    else:
+        st.info("Select a well from the dropdown to view its production profile.")
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -854,20 +1006,31 @@ else:
 st.subheader("Downloadable Production Summary Report")
 
 # Build the summary report
-summary_rows = []
-for well in sorted(filtered["Wellbore name"].unique()):
-    well_data = filtered[filtered["Wellbore name"] == well]
-    summary_rows.append({
-        "Wellbore Name": well,
-        "Total Oil (Sm³)": well_data["Oil"].sum(),
-        "Total Gas (Sm³)": well_data["Gas"].sum(),
-        "Total Water (Sm³)": well_data["Water"].sum(),
-        "First Production": well_data["Date"].min().strftime("%Y-%m") if not well_data.empty else "",
-        "Last Production": well_data["Date"].max().strftime("%Y-%m") if not well_data.empty else "",
-        "Months On Stream": well_data["Date"].nunique(),
-    })
-
-summary_report = pd.DataFrame(summary_rows)
+if "Wellbore name" in filtered.columns:
+    summary_rows = []
+    for well in sorted(filtered["Wellbore name"].unique()):
+        well_data = filtered[filtered["Wellbore name"] == well]
+        summary_rows.append({
+            "Wellbore Name": well,
+            "Total Oil (Sm³)": well_data["Oil"].sum(),
+            "Total Gas (Sm³)": well_data["Gas"].sum(),
+            "Total Water (Sm³)": well_data["Water"].sum(),
+            "First Production": well_data["Date"].min().strftime("%Y-%m") if not well_data.empty else "",
+            "Last Production": well_data["Date"].max().strftime("%Y-%m") if not well_data.empty else "",
+            "Months On Stream": well_data["Date"].nunique(),
+        })
+    summary_report = pd.DataFrame(summary_rows)
+else:
+    # Aggregate report — single summary row
+    summary_report = pd.DataFrame([{
+        "Wellbore Name": "Aggregate",
+        "Total Oil (Sm³)": filtered["Oil"].sum() if "Oil" in filtered.columns else 0,
+        "Total Gas (Sm³)": filtered["Gas"].sum() if "Gas" in filtered.columns else 0,
+        "Total Water (Sm³)": filtered["Water"].sum() if "Water" in filtered.columns else 0,
+        "First Production": filtered["Date"].min().strftime("%Y-%m") if "Date" in filtered.columns and not filtered.empty else "",
+        "Last Production": filtered["Date"].max().strftime("%Y-%m") if "Date" in filtered.columns and not filtered.empty else "",
+        "Months On Stream": filtered["Date"].nunique() if "Date" in filtered.columns else 0,
+    }])
 
 st.dataframe(summary_report.style.format({
         "Total Oil (Sm³)": "{:,.0f}",
